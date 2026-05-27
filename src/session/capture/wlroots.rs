@@ -41,6 +41,9 @@ const WAYLAND_POLL_TIMEOUT_MS: i32 = 5;
 
 pub struct WlrootsReady {
 	pub hdr: bool,
+	pub width: u32,
+	pub height: u32,
+	pub refresh_rate: u32,
 }
 
 type WlrootsHandles = (
@@ -145,8 +148,22 @@ fn run_capture(
 
 	match state.startup_result.take() {
 		Some(Ok(())) => {
-			let _ = ready_tx.send(Ok(WlrootsReady { hdr: false }));
-			tracing::info!("wlroots capture started: {}x{} @ {}Hz", width, height, refresh_rate);
+			let ready_width = state.buffer_width.max(1);
+			let ready_height = state.buffer_height.max(1);
+			let _ = ready_tx.send(Ok(WlrootsReady {
+				hdr: false,
+				width: ready_width,
+				height: ready_height,
+				refresh_rate,
+			}));
+			tracing::info!(
+				"wlroots capture started: {}x{} @ {}Hz (client requested {}x{})",
+				ready_width,
+				ready_height,
+				refresh_rate,
+				width,
+				height
+			);
 		},
 		Some(Err(e)) => return Err(e),
 		None => return Ok(()),
@@ -248,7 +265,6 @@ struct CaptureSlot {
 
 struct PendingFrame {
 	frame: ZwlrScreencopyFrameV1,
-	immediate: bool,
 	slot_index: Option<usize>,
 	offered_format: Option<u32>,
 	offered_width: u32,
@@ -291,6 +307,7 @@ struct WlrootsState {
 	startup_result: Option<Result<(), String>>,
 	startup_complete: bool,
 	warned_y_inverted: bool,
+	warned_size_mismatch: bool,
 }
 
 impl WlrootsState {
@@ -335,6 +352,7 @@ impl WlrootsState {
 			startup_result: None,
 			startup_complete: false,
 			warned_y_inverted: false,
+			warned_size_mismatch: false,
 		}
 	}
 
@@ -474,7 +492,6 @@ impl WlrootsState {
 		let frame = manager.capture_output(self.config.render_cursor as i32, output, qh, ());
 		self.pending_frame = Some(PendingFrame {
 			frame: frame.clone(),
-			immediate,
 			slot_index: None,
 			offered_format: None,
 			offered_width: 0,
@@ -504,12 +521,13 @@ impl WlrootsState {
 			return;
 		};
 
-		if width != self.expected_width || height != self.expected_height {
-			self.finish_capture_with_error(format!(
-				"wlroots output size {width}x{height} does not match requested stream size {}x{}",
-				self.expected_width, self.expected_height
-			));
-			return;
+		if (width != self.expected_width || height != self.expected_height) && !self.warned_size_mismatch {
+			self.warned_size_mismatch = true;
+			tracing::warn!(
+				"wlroots output size {width}x{height} does not match requested stream size {}x{}; streaming captured output size",
+				self.expected_width,
+				self.expected_height
+			);
 		}
 
 		if let Err(e) = self.ensure_buffer_pool(format, width, height, qh) {
@@ -525,11 +543,9 @@ impl WlrootsState {
 
 		if let Some(pending) = self.pending_frame.as_mut() {
 			pending.slot_index = Some(slot_index);
-			if pending.immediate {
-				frame.copy(&self.buffer_pool[slot_index].wl_buffer);
-			} else {
-				frame.copy_with_damage(&self.buffer_pool[slot_index].wl_buffer);
-			}
+			// Moonlight expects a steady video cadence even when the desktop is
+			// static; damage-only copies can stall indefinitely after startup.
+			frame.copy(&self.buffer_pool[slot_index].wl_buffer);
 		}
 	}
 
@@ -1076,6 +1092,8 @@ mod tests {
 			.expect("wlroots capture should report readiness")
 			.expect("wlroots capture should initialize");
 		assert!(!ready.hdr);
+		assert!(ready.width > 0);
+		assert!(ready.height > 0);
 
 		input_tx
 			.send(CompositorInputEvent::MouseMoveRelative { dx: 0, dy: 0 })
@@ -1084,8 +1102,8 @@ mod tests {
 		let frame = frame_rx
 			.recv_timeout(Duration::from_secs(2))
 			.expect("wlroots capture should produce a frame");
-		assert_eq!(frame.width, width);
-		assert_eq!(frame.height, height);
+		assert_eq!(frame.width, ready.width);
+		assert_eq!(frame.height, ready.height);
 		assert!(!frame.planes.is_empty());
 		assert_eq!(frame.color_space, FrameColorSpace::Srgb);
 		assert!(frame.hdr_metadata.is_none());

@@ -135,24 +135,6 @@ impl Packetizer {
 		})
 	}
 
-	/// Pre-create FEC encoders for all possible block sizes to avoid
-	/// expensive ReedSolomon matrix construction during frame processing.
-	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
-
-		for nr_data_shards in 1..=nr_data_shards_per_block {
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
-			if nr_parity_shards > 0 {
-				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
-			}
-		}
-
-		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
-	}
-
 	/// Packetize an encoded frame into a batch of network-ready shards.
 	///
 	/// Returns a `ShardBatch` containing all data + parity shards packed

@@ -122,8 +122,8 @@ impl Session {
 			// Compositor handles are stored here after Launch and consumed by Start.
 			compositor_frame_rx: None,
 			compositor_input_tx: None,
-			// HDR mode flag agreed during Start, used to configure streaming.
-			compositor_hdr: false,
+			// Capture properties are stored here after Launch and consumed by Start.
+			capture_ready: None,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
@@ -188,6 +188,14 @@ impl Session {
 type CompositorFrameRx = std::sync::mpsc::Receiver<compositor::frame::ExportedFrame>;
 type CaptureInputTx = capture::CaptureInputSender;
 
+#[derive(Clone, Copy, Debug)]
+struct CaptureReady {
+	hdr: bool,
+	width: u32,
+	height: u32,
+	refresh_rate: u32,
+}
+
 struct SessionInner {
 	config: Config,
 	video_stream: Option<VideoStream>,
@@ -199,8 +207,8 @@ struct SessionInner {
 	compositor_frame_rx: Option<CompositorFrameRx>,
 	/// Input sender to the compositor, populated after Launch, consumed by Start.
 	compositor_input_tx: Option<CaptureInputTx>,
-	/// HDR mode flag agreed during Start, used to configure streaming.
-	compositor_hdr: bool,
+	/// Capture properties populated during Launch and consumed by Start.
+	capture_ready: Option<CaptureReady>,
 }
 
 impl SessionInner {
@@ -232,7 +240,8 @@ impl SessionInner {
 					};
 
 					// Channel to pass capture handles back from the thread to SessionInner.
-					let (handles_tx, handles_rx) = oneshot::channel::<(CompositorFrameRx, CaptureInputTx, bool)>();
+					let (handles_tx, handles_rx) =
+						oneshot::channel::<(CompositorFrameRx, CaptureInputTx, CaptureReady)>();
 
 					let app_context = session_context.clone();
 					let app_pulse_dir = self.pulse_dir.clone();
@@ -260,7 +269,7 @@ impl SessionInner {
 									CaptureInputTx,
 									LaunchedProcess,
 									Option<std::path::PathBuf>,
-									bool,
+									CaptureReady,
 								),
 								AppLaunchError,
 							>;
@@ -331,7 +340,12 @@ impl SessionInner {
 											capture::CaptureInputSender::Compositor(input_tx),
 											LaunchedProcess::Child(child),
 											Some(log_path),
-											ready.hdr,
+											CaptureReady {
+												hdr: ready.hdr,
+												width: app_context.resolution.0,
+												height: app_context.resolution.1,
+												refresh_rate: app_context.refresh_rate,
+											},
 										))
 									},
 									CaptureConfig::Wlroots(wlroots_config) => {
@@ -360,15 +374,26 @@ impl SessionInner {
 												AppLaunchError::CompositorFailed
 											})?;
 
-										Ok((frame_rx, input_tx, LaunchedProcess::None, None, ready.hdr))
+										Ok((
+											frame_rx,
+											input_tx,
+											LaunchedProcess::None,
+											None,
+											CaptureReady {
+												hdr: ready.hdr,
+												width: ready.width,
+												height: ready.height,
+												refresh_rate: ready.refresh_rate,
+											},
+										))
 									},
 								}
 							})();
 
 							match result {
-								Ok((frame_rx, input_tx, process, _log_path, capture_hdr)) => {
+								Ok((frame_rx, input_tx, process, _log_path, capture_ready)) => {
 									// Send capture handles back to SessionInner so Start can use them.
-									let _ = handles_tx.send((frame_rx, input_tx, capture_hdr));
+									let _ = handles_tx.send((frame_rx, input_tx, capture_ready));
 									// Notify the HTTP handler that launch succeeded.
 									let _ = result_tx.send(Ok(()));
 
@@ -427,10 +452,10 @@ impl SessionInner {
 						_ = stop_session_manager.wait_shutdown_triggered() => None,
 					};
 					match handles_result {
-						Some(Ok(Ok((frame_rx, input_tx, capture_hdr)))) => {
+						Some(Ok(Ok((frame_rx, input_tx, capture_ready)))) => {
 							self.compositor_frame_rx = Some(frame_rx);
 							self.compositor_input_tx = Some(input_tx);
-							self.compositor_hdr = capture_hdr;
+							self.capture_ready = Some(capture_ready);
 						},
 						Some(Ok(Err(_))) => {
 							// Thread sent an error via result_tx; handles were not produced.
@@ -467,12 +492,37 @@ impl SessionInner {
 							continue;
 						},
 					};
+					let capture_ready = self.capture_ready.take().unwrap_or(CaptureReady {
+						hdr: false,
+						width: session_context.resolution.0,
+						height: session_context.resolution.1,
+						refresh_rate: session_context.refresh_rate,
+					});
+
+					if video_stream_context.width != capture_ready.width
+						|| video_stream_context.height != capture_ready.height
+					{
+						tracing::warn!(
+							"Client video stream size {}x{} does not match capture size {}x{}; encoding capture size",
+							video_stream_context.width,
+							video_stream_context.height,
+							capture_ready.width,
+							capture_ready.height
+						);
+						video_stream_context.width = capture_ready.width;
+						video_stream_context.height = capture_ready.height;
+					}
+					if video_stream_context.fps == 0 {
+						video_stream_context.fps = capture_ready.refresh_rate;
+					}
+					session_context.resolution = (capture_ready.width, capture_ready.height);
+					session_context.refresh_rate = capture_ready.refresh_rate;
 
 					// HDR mode from RTSP ANNOUNCE is only honored when the capture
 					// backend confirmed HDR support during Launch. wlroots capture is
 					// SDR-only for now.
 					let requested_hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
-					let hdr = self.compositor_hdr && requested_hdr;
+					let hdr = capture_ready.hdr && requested_hdr;
 					if requested_hdr && !hdr {
 						tracing::info!("Capture backend is SDR-only; forcing video stream dynamic range to SDR.");
 						video_stream_context.dynamic_range = VideoDynamicRange::Sdr;

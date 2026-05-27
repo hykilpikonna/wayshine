@@ -4,8 +4,10 @@ use rtsp_types::{
 	Method,
 };
 use std::{
+	collections::BTreeMap,
 	net::{SocketAddr, ToSocketAddrs},
 	str::FromStr,
+	sync::{Arc, Mutex},
 };
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -41,6 +43,13 @@ enum EncryptionFlags {
 pub struct RtspServer {
 	config: Config,
 	session_manager: SessionManager,
+	stream_destinations: Arc<Mutex<RtspStreamDestinations>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RtspStreamDestinations {
+	video: Option<SocketAddr>,
+	audio: Option<SocketAddr>,
 }
 
 impl RtspServer {
@@ -48,6 +57,7 @@ impl RtspServer {
 		let server = Self {
 			config: config.clone(),
 			session_manager,
+			stream_destinations: Arc::new(Mutex::new(RtspStreamDestinations::default())),
 		};
 
 		tokio::spawn({
@@ -179,7 +189,12 @@ impl RtspServer {
 			.build(Vec::new())
 	}
 
-	fn handle_setup_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
+	fn handle_setup_request(
+		&self,
+		request: &rtsp_types::Request<Vec<u8>>,
+		cseq: i32,
+		rtsp_peer_address: SocketAddr,
+	) -> rtsp_types::Response<Vec<u8>> {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
 			Err(e) => {
@@ -196,55 +211,70 @@ impl RtspServer {
 		};
 
 		if let Some(transport) = (*transports).first() {
-			match transport {
-				Transport::Other(_transport) => {
-					let request_uri = match request.request_uri() {
-						Some(query) => query,
-						None => {
-							tracing::warn!("No request URI in SETUP request.");
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-						},
-					};
-					let query = match request_uri.query_pairs().next() {
-						Some(query) => query,
-						None => {
-							tracing::warn!("No query in request URI in SETUP request.");
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-						},
-					};
-					if query.0 != "streamid" {
-						tracing::warn!("Expected only one query parameter with 'streamid', but didn't find it.");
-						return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-					}
-
-					// Example query: streamid=control/13/0
-					let (stream_id, port) = match query.1.split('/').next() {
-						Some("video") => ("video", self.config.stream.video.port),
-						Some("audio") => ("audio", self.config.stream.audio.port),
-						Some("control") => ("control", self.config.stream.control.port),
-						Some(stream) => {
-							tracing::warn!("Unknown stream '{stream}'");
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-						},
-						None => {
-							tracing::warn!("Unexpected query format for query '{}'", query.1);
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-						},
-					};
-
-					tracing::debug!("Responding with server_port={port} for stream '{stream_id}'.");
-
-					return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
-						.header(headers::CSEQ, cseq.to_string())
-						.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-						.header(headers::TRANSPORT, format!("server_port={port}"))
-						.build(Vec::new());
-				},
-				t => {
-					tracing::warn!("Received request for unsupported transport: {:?}", t);
+			let request_uri = match request.request_uri() {
+				Some(query) => query,
+				None => {
+					tracing::warn!("No request URI in SETUP request.");
 					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 				},
+			};
+			let query = match request_uri.query_pairs().next() {
+				Some(query) => query,
+				None => {
+					tracing::warn!("No query in request URI in SETUP request.");
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+			};
+			if query.0 != "streamid" {
+				tracing::warn!("Expected only one query parameter with 'streamid', but didn't find it.");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			}
+
+			// Example query: streamid=control/13/0
+			let (stream_id, port) = match query.1.split('/').next() {
+				Some("video") => ("video", self.config.stream.video.port),
+				Some("audio") => ("audio", self.config.stream.audio.port),
+				Some("control") => ("control", self.config.stream.control.port),
+				Some(stream) => {
+					tracing::warn!("Unknown stream '{stream}'");
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+				None => {
+					tracing::warn!("Unexpected query format for query '{}'", query.1);
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+			};
+
+			if let Some(client_port) = transport_client_port(transport) {
+				let client_address = SocketAddr::new(rtsp_peer_address.ip(), client_port);
+				match self.stream_destinations.lock() {
+					Ok(mut destinations) => match stream_id {
+						"video" => {
+							destinations.video = Some(client_address);
+							tracing::debug!("Using RTSP SETUP destination {client_address} for video RTP.");
+						},
+						"audio" => {
+							destinations.audio = Some(client_address);
+							tracing::debug!("Using RTSP SETUP destination {client_address} for audio RTP.");
+						},
+						"control" => {},
+						_ => unreachable!("stream_id was validated above"),
+					},
+					Err(e) => {
+						tracing::warn!("Failed to store RTSP stream destination: {e}");
+					},
+				}
+			} else {
+				tracing::debug!("No client_port found in SETUP transport for stream '{stream_id}'.");
+			}
+
+			tracing::debug!("Responding with server_port={port} for stream '{stream_id}'.");
+
+			return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
+				.header(headers::CSEQ, cseq.to_string())
+				.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
+				.header(headers::TRANSPORT, format!("server_port={port}"))
+				.build(Vec::new());
 		}
 
 		tracing::warn!("No transports found in SETUP request.");
@@ -357,6 +387,13 @@ impl RtspServer {
 		// Parse the client's encryption flags from the ANNOUNCE SDP.
 		let client_encryption_flags: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
+		let stream_destinations = match self.stream_destinations.lock() {
+			Ok(destinations) => *destinations,
+			Err(e) => {
+				tracing::warn!("Failed to read RTSP stream destinations: {e}");
+				RtspStreamDestinations::default()
+			},
+		};
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -372,7 +409,13 @@ impl RtspServer {
 			max_reference_frames,
 			encrypt_video: self.config.stream.video.encrypt
 				&& (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
+			client_address: stream_destinations.video,
 		};
+		if let Some(client_address) = stream_destinations.video {
+			tracing::debug!("Video RTP destination from RTSP SETUP: {client_address}.");
+		} else {
+			tracing::debug!("No video RTP destination from RTSP SETUP; waiting for video PING.");
+		}
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
 			Ok(packet_duration) => packet_duration,
@@ -424,7 +467,13 @@ impl RtspServer {
 			qos: audio_qos_type != "0",
 			audio_config,
 			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
+			client_address: stream_destinations.audio,
 		};
+		if let Some(client_address) = stream_destinations.audio {
+			tracing::debug!("Audio RTP destination from RTSP SETUP: {client_address}.");
+		} else {
+			tracing::debug!("No audio RTP destination from RTSP SETUP; waiting for audio PING.");
+		}
 
 		if self
 			.session_manager
@@ -519,7 +568,7 @@ impl RtspServer {
 					Method::Announce => self.handle_announce_request(request, cseq).await,
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq),
+					Method::Setup => self.handle_setup_request(request, cseq, address),
 					Method::Play => self.handle_play_request(request, cseq).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
@@ -583,4 +632,80 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 		.trim()
 		.parse()
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
+}
+
+fn transport_client_port(transport: &Transport) -> Option<u16> {
+	match transport {
+		Transport::Rtp(rtp) => rtp.params.client_port.map(|(port, _)| port),
+		Transport::Other(other) => transport_parameters_client_port(&other.params.0),
+	}
+}
+
+fn transport_parameters_client_port(params: &BTreeMap<String, Option<String>>) -> Option<u16> {
+	params.iter().find_map(|(name, value)| {
+		// Moonlight sends X-GS-ClientPort=50000-50001 as a handshake placeholder.
+		// Its real RTP destination is the source port of the later UDP PING.
+		if name.eq_ignore_ascii_case("client_port") {
+			value.as_deref().and_then(parse_transport_port_start)
+		} else {
+			None
+		}
+	})
+}
+
+fn parse_transport_port_start(value: &str) -> Option<u16> {
+	value
+		.trim()
+		.trim_matches('"')
+		.split('-')
+		.next()
+		.and_then(|port| port.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parses_client_port_from_other_transport() {
+		let mut params = BTreeMap::new();
+		params.insert("client_port".to_string(), Some("48000-48001".to_string()));
+		let transport = Transport::Other(headers::OtherTransport {
+			spec: "X-NV-Audio".to_string(),
+			params: headers::TransportParameters(params),
+		});
+
+		assert_eq!(transport_client_port(&transport), Some(48000));
+	}
+
+	#[test]
+	fn ignores_x_gs_client_port_placeholder() {
+		let mut params = BTreeMap::new();
+		params.insert("X-GS-ClientPort".to_string(), Some("50000-50001".to_string()));
+		let transport = Transport::Other(headers::OtherTransport {
+			spec: "unicast".to_string(),
+			params: headers::TransportParameters(params),
+		});
+
+		assert_eq!(transport_client_port(&transport), None);
+	}
+
+	#[test]
+	fn parses_client_port_from_rtp_transport() {
+		let transport = Transport::Rtp(headers::RtpTransport {
+			profile: headers::RtpProfile::Avp,
+			lower_transport: None,
+			params: headers::RtpTransportParameters {
+				client_port: Some((47998, Some(47999))),
+				..Default::default()
+			},
+		});
+
+		assert_eq!(transport_client_port(&transport), Some(47998));
+	}
+
+	#[test]
+	fn parses_quoted_single_client_port() {
+		assert_eq!(parse_transport_port_start("\"48000\""), Some(48000));
+	}
 }

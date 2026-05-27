@@ -1,4 +1,5 @@
 use async_shutdown::ShutdownManager;
+use std::net::SocketAddr;
 use tokio::{net::UdpSocket, sync::mpsc};
 
 use crate::{
@@ -129,6 +130,7 @@ pub struct AudioStreamContext {
 	pub audio_config: AudioConfig,
 	/// Whether the client has enabled audio encryption.
 	pub encrypt_audio: bool,
+	pub client_address: Option<SocketAddr>,
 }
 
 enum AudioStreamCommand {
@@ -176,6 +178,7 @@ impl AudioStream {
 			packet_duration_ms: context.packet_duration_ms,
 			audio_config: context.audio_config,
 			encrypt_audio: context.encrypt_audio,
+			client_address: context.client_address,
 			pulse_server_close_tx: None,
 			pulse_server_waker: None,
 		};
@@ -209,6 +212,7 @@ struct AudioStreamInner {
 	packet_duration_ms: u32,
 	audio_config: AudioConfig,
 	encrypt_audio: bool,
+	client_address: Option<SocketAddr>,
 	pulse_server_close_tx: Option<crossbeam_channel::Sender<()>>,
 	pulse_server_waker: Option<mio::Waker>,
 }
@@ -225,7 +229,12 @@ impl AudioStreamInner {
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
-		tokio::spawn(handle_audio_packets(packet_rx, socket, stop_session_manager.clone()));
+		tokio::spawn(handle_audio_packets(
+			packet_rx,
+			socket,
+			stop_session_manager.clone(),
+			self.client_address,
+		));
 
 		let mut started_streaming = false;
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
@@ -321,9 +330,13 @@ async fn handle_audio_packets(
 	mut packet_rx: mpsc::Receiver<Vec<u8>>,
 	socket: UdpSocket,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	initial_client_address: Option<SocketAddr>,
 ) {
 	let mut buf = [0; 1024];
-	let mut client_address = None;
+	let mut client_address = initial_client_address;
+	if let Some(client_address) = client_address {
+		tracing::debug!("Sending audio RTP packets to initial RTSP destination {client_address}.");
+	}
 
 	// Trigger session shutdown when the audio packet stream stops.
 	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioPacketHandlerStopped);
@@ -358,10 +371,14 @@ async fn handle_audio_packets(
 				};
 
 				if &buf[..len] == b"PING" {
-					tracing::trace!("Received video stream PING message from {address}.");
-					client_address = Some(address);
+					if client_address.is_none() {
+						tracing::debug!("Received audio stream PING message from {address}; using it as RTP destination.");
+						client_address = Some(address);
+					} else {
+						tracing::debug!("Received audio stream PING message from {address}.");
+					}
 				} else {
-					tracing::warn!("Received unknown message on video stream of length {len}.");
+					tracing::warn!("Received unknown message on audio stream of length {len}.");
 				}
 			},
 		}

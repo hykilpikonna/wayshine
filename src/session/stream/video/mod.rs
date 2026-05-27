@@ -1,4 +1,5 @@
 use async_shutdown::ShutdownManager;
+use std::net::SocketAddr;
 use tokio::{
 	net::UdpSocket,
 	sync::{broadcast, mpsc, watch},
@@ -93,6 +94,7 @@ pub struct VideoStreamContext {
 	pub max_reference_frames: u32,
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
+	pub client_address: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -183,7 +185,12 @@ impl VideoStreamInner {
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
-		tokio::spawn(handle_video_packets(packet_rx, socket, stop_session_manager.clone()));
+		tokio::spawn(handle_video_packets(
+			packet_rx,
+			socket,
+			stop_session_manager.clone(),
+			self.context.client_address,
+		));
 
 		let mut started_streaming = false;
 		let (idr_frame_request_tx, _idr_frame_request_rx) = tokio::sync::broadcast::channel(1);
@@ -265,9 +272,13 @@ async fn handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	initial_client_address: Option<SocketAddr>,
 ) {
 	let mut buf = [0; 1024];
-	let mut client_address = None;
+	let mut client_address = initial_client_address;
+	if let Some(client_address) = client_address {
+		tracing::debug!("Sending video RTP packets to initial RTSP destination {client_address}.");
+	}
 
 	// Trigger session shutdown if we exit unexpectedly.
 	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
@@ -303,8 +314,12 @@ async fn handle_video_packets(
 				};
 
 				if &buf[..len] == b"PING" {
-					tracing::trace!("Received video stream PING message from {address}.");
-					client_address = Some(address);
+					if client_address.is_none() {
+						tracing::debug!("Received video stream PING message from {address}; using it as RTP destination.");
+						client_address = Some(address);
+					} else {
+						tracing::debug!("Received video stream PING message from {address}.");
+					}
 				} else {
 					tracing::warn!("Received unknown message on video stream of length {len}.");
 				}

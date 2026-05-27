@@ -324,7 +324,6 @@ impl VideoPipelineInner {
 
 		let mut packetizer = Packetizer::new(self.encryption_key.as_deref())
 			.map_err(|()| "Failed to create packetizer: invalid encryption key length".to_string())?;
-		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
