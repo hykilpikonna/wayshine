@@ -103,6 +103,7 @@ impl State {
 			Ok(false)
 		} else {
 			data.clients.insert(client);
+			drop(data);
 			self.save()?;
 			Ok(true)
 		}
@@ -122,6 +123,7 @@ impl State {
 			.write()
 			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
 		let inserted = data.paired_certs.insert(fingerprint);
+		drop(data);
 		if inserted {
 			self.save()?;
 		} else {
@@ -140,4 +142,25 @@ impl State {
 	// 	self.save()?;
 	// 	Ok(true)
 	// }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn adding_clients_and_paired_certs_persists_without_deadlock() {
+		let tempdir = tempfile::tempdir().unwrap();
+		let state = State {
+			data: Arc::new(RwLock::new(StateData::new())),
+			path: tempdir.path().join("state.toml"),
+		};
+
+		assert_eq!(state.add_client("client-1".to_string()), Ok(true));
+		assert_eq!(state.add_paired_cert("cert-1".to_string()), Ok(true));
+
+		let saved = std::fs::read_to_string(tempdir.path().join("state.toml")).unwrap();
+		assert!(saved.contains("client-1"));
+		assert!(saved.contains("cert-1"));
+	}
 }

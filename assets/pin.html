@@ -130,10 +130,11 @@
 			}
 
 			const uniqueid = document.getElementById("uniqueid-value").textContent.trim();
+			const body = new URLSearchParams({ uniqueid, pin });
 			const response = await fetch('/submit-pin', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-				body: `uniqueid=${uniqueid}&pin=${pin}`
+				body
 			});
 
 			if (response.ok) {

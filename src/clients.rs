@@ -95,6 +95,13 @@ impl ClientManager {
 		Ok(())
 	}
 
+	pub fn pending_client_id(&self) -> Result<Option<String>, ()> {
+		let inner = self.inner.read().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		Ok(inner.pending_clients.keys().next().cloned())
+	}
+
 	pub fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
 		let mut inner = self.inner.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
@@ -188,16 +195,19 @@ impl ClientManager {
 	}
 
 	pub fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
-			tracing::error!("RwLock poisoned: {poison}");
-		})?;
-		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
-			tracing::warn!("No known client with id {id}");
-		})?;
-		verify_pairing_secret(client, client_secret)
-			.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))?;
+		let fingerprint = {
+			let mut inner = self.inner.write().map_err(|poison| {
+				tracing::error!("RwLock poisoned: {poison}");
+			})?;
+			let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+				tracing::warn!("No known client with id {id}");
+			})?;
+			verify_pairing_secret(client, client_secret)
+				.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))?;
 
-		let fingerprint = cert_pem_fingerprint(&client.pem);
+			cert_pem_fingerprint(&client.pem)
+		};
+
 		if let Some(fp) = &fingerprint {
 			self.state
 				.add_paired_cert(fp.clone())
@@ -213,6 +223,11 @@ impl ClientManager {
 				.add_client(id.to_string())
 				.map_err(|_| tracing::warn!("Failed to persist client '{id}'"))?;
 		}
+
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		inner.pending_clients.remove(id);
 
 		Ok(())
 	}

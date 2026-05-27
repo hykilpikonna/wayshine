@@ -40,6 +40,7 @@ pub mod tls;
 // The negative fourth value is to indicate that we are following the protocol introduced with Sunshine.
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
+const PIN_PLACEHOLDER_UNIQUE_ID: &str = "0123456789ABCDEF";
 
 #[repr(u32)]
 #[allow(dead_code)]
@@ -568,15 +569,22 @@ impl Webserver {
 	async fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let unique_id = params
 			.get("uniqueid")
-			.cloned()
-			.map(|id| {
-				id.chars()
-					.filter(|c| c.is_ascii_hexdigit())
-					.take(16)
-					.collect::<String>()
-			})
-			.filter(|id| !id.is_empty())
-			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
+			.and_then(|id| sanitize_unique_id(id))
+			.or_else(|| match self.client_manager.pending_client_id() {
+				Ok(unique_id) => unique_id,
+				Err(()) => None,
+			});
+
+		let unique_id = match unique_id {
+			Some(unique_id) => unique_id,
+			None => {
+				let message = "No pending pairing request found. Start pairing from Moonlight first.".to_string();
+				tracing::warn!("{message}");
+				return bad_request(message);
+			},
+		};
+
+		tracing::debug!("Rendering PIN page for client id {unique_id}.");
 		let content = include_bytes!("../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
 		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
@@ -601,7 +609,16 @@ impl Webserver {
 
 		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
 
-		let unique_id = match params.get("uniqueid") {
+		let unique_id = match params.get("uniqueid").and_then(|id| sanitize_unique_id(id)) {
+			Some(unique_id) if unique_id.eq_ignore_ascii_case(PIN_PLACEHOLDER_UNIQUE_ID) => {
+				match self.client_manager.pending_client_id() {
+					Ok(Some(unique_id)) => unique_id,
+					Ok(None) | Err(()) => {
+						tracing::warn!("PIN submission used placeholder client id, but no pairing request is pending.");
+						return bad_request("No pending pairing request found.".to_string());
+					},
+				}
+			},
 			Some(unique_id) => unique_id,
 			None => {
 				tracing::warn!("Missing 'uniqueid' in PIN submission.");
@@ -617,7 +634,7 @@ impl Webserver {
 			},
 		};
 
-		let response = self.client_manager.register_pin(unique_id, pin);
+		let response = self.client_manager.register_pin(&unique_id, pin);
 		match response {
 			Ok(()) => {
 				tracing::info!("PIN registered successfully.");
@@ -1048,6 +1065,19 @@ fn not_found() -> Response<Full<Bytes>> {
 		.status(StatusCode::NOT_FOUND)
 		.body(Full::new(Bytes::from("NOT FOUND")))
 		.unwrap()
+}
+
+fn sanitize_unique_id(unique_id: &str) -> Option<String> {
+	let unique_id = unique_id
+		.chars()
+		.filter(|c| c.is_ascii_hexdigit())
+		.take(16)
+		.collect::<String>();
+	if unique_id.is_empty() {
+		None
+	} else {
+		Some(unique_id)
+	}
 }
 
 fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
