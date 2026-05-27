@@ -12,6 +12,7 @@ use crate::{
 	config::Config,
 	crypto::{decrypt, encrypt},
 	session::{
+		capture::CaptureInputSender,
 		compositor::frame::{HdrMetadata, HdrModeState},
 		manager::SessionShutdownReason,
 		SessionContext, SessionKeys,
@@ -227,7 +228,7 @@ impl ControlStream {
 		audio_stream: AudioStream,
 		context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
+		input_tx: CaptureInputSender,
 		hdr: bool,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) -> Result<Self, ()> {

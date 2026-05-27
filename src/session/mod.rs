@@ -6,7 +6,7 @@ use manager::{AppLaunchError, SessionShutdownReason};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-	config::{ApplicationConfig, Config},
+	config::{ApplicationConfig, CaptureConfig, Config},
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
@@ -15,6 +15,7 @@ use self::stream::VideoDynamicRange;
 use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
+pub mod capture;
 pub mod compositor;
 pub mod manager;
 pub mod stream;
@@ -185,7 +186,7 @@ impl Session {
 
 /// Type aliases for compositor handle channels (mirrors what `compositor::start_compositor` returns).
 type CompositorFrameRx = std::sync::mpsc::Receiver<compositor::frame::ExportedFrame>;
-type CompositorInputTx = calloop::channel::Sender<compositor::input::CompositorInputEvent>;
+type CaptureInputTx = capture::CaptureInputSender;
 
 struct SessionInner {
 	config: Config,
@@ -197,7 +198,7 @@ struct SessionInner {
 	/// Frame receiver from the compositor, populated after Launch, consumed by Start.
 	compositor_frame_rx: Option<CompositorFrameRx>,
 	/// Input sender to the compositor, populated after Launch, consumed by Start.
-	compositor_input_tx: Option<CompositorInputTx>,
+	compositor_input_tx: Option<CaptureInputTx>,
 	/// HDR mode flag agreed during Start, used to configure streaming.
 	compositor_hdr: bool,
 }
@@ -230,8 +231,8 @@ impl SessionInner {
 						hdr: session_context.hdr,
 					};
 
-					// Channel to pass compositor handles back from the thread to SessionInner.
-					let (handles_tx, handles_rx) = oneshot::channel::<(CompositorFrameRx, CompositorInputTx)>();
+					// Channel to pass capture handles back from the thread to SessionInner.
+					let (handles_tx, handles_rx) = oneshot::channel::<(CompositorFrameRx, CaptureInputTx, bool)>();
 
 					let app_context = session_context.clone();
 					let app_pulse_dir = self.pulse_dir.clone();
@@ -242,93 +243,150 @@ impl SessionInner {
 					let spawn_failure_shutdown = app_shutdown_manager.clone();
 					let timeout_shutdown = app_shutdown_manager.clone();
 
-					// Spawn the blocking app-launcher thread. It starts the compositor,
-					// waits for XWayland, launches the application, polls the grace period,
-					// and then sends the result via result_tx. On any failure inside the
-					// closure, `result_tx` is sent `Err(...)` and `handles_tx` is dropped
-					// (causing `handles_rx` to resolve immediately with an error).
+					// Spawn the blocking app-launcher thread. For managed sessions it
+					// starts the embedded compositor and app. For wlroots desktop
+					// sessions it attaches to the existing compositor and keeps the
+					// launch thread alive until session shutdown.
 					if let Err(e) = std::thread::Builder::new()
 						.name("app-launcher".to_string())
 						.spawn(move || {
-							let result = (|| -> Result<(CompositorFrameRx, CompositorInputTx, Child, std::path::PathBuf), AppLaunchError> {
+							enum LaunchedProcess {
+								Child(Child),
+								None,
+							}
+							type LaunchResult = Result<
+								(
+									CompositorFrameRx,
+									CaptureInputTx,
+									LaunchedProcess,
+									Option<std::path::PathBuf>,
+									bool,
+								),
+								AppLaunchError,
+							>;
+
+							let result = (|| -> LaunchResult {
 								run_hook("pre_command", &app_context.application.pre_command);
 
-						let (frame_rx, input_tx, ready_rx) =
-								compositor::start_compositor(keyboard_config, compositor_config, app_shutdown_manager.clone())
-									.map_err(|e| {
+								match &app_context.application.capture {
+									CaptureConfig::Managed => {
+										let (frame_rx, input_tx, ready_rx) = compositor::start_compositor(
+											keyboard_config,
+											compositor_config,
+											app_shutdown_manager.clone(),
+										)
+										.map_err(|e| {
 											tracing::error!("Failed to start compositor: {e}");
 											AppLaunchError::CompositorFailed
 										})?;
 
-								let ready = ready_rx
-									.recv_timeout(std::time::Duration::from_secs(5))
-									.map_err(|e| {
-										tracing::warn!("Timed out waiting for XWayland display: {e}");
-										AppLaunchError::XWaylandTimeout
-									})?;
+										let ready =
+											ready_rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| {
+												tracing::warn!("Timed out waiting for XWayland display: {e}");
+												AppLaunchError::XWaylandTimeout
+											})?;
 
-						let (mut child, log_path) =
-								launch_application(&app_context, &app_pulse_dir, &ready, ready.hdr)
-									.map_err(|()| AppLaunchError::SpawnFailed)?;
+										let (mut child, log_path) =
+											launch_application(&app_context, &app_pulse_dir, &ready, ready.hdr)
+												.map_err(|()| AppLaunchError::SpawnFailed)?;
 
-								// Poll for early exit during the grace period.
-								let grace_duration = std::time::Duration::from_secs(APP_GRACE_PERIOD_SECS);
-								let poll_interval = std::time::Duration::from_millis(APP_GRACE_POLL_MS);
-								let deadline = std::time::Instant::now() + grace_duration;
-								loop {
-									match child.try_wait() {
-										Ok(Some(_)) => {
-											// App exited within the grace period.
+										// Poll for early exit during the grace period.
+										let grace_duration = std::time::Duration::from_secs(APP_GRACE_PERIOD_SECS);
+										let poll_interval = std::time::Duration::from_millis(APP_GRACE_POLL_MS);
+										let deadline = std::time::Instant::now() + grace_duration;
+										loop {
+											match child.try_wait() {
+												Ok(Some(_)) => {
+													tracing::info!(
+														"Application exited unexpectedly. stdout/stderr saved to: {}",
+														log_path.display()
+													);
+													let _ = app_shutdown_manager
+														.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+													return Err(AppLaunchError::ExitedEarly);
+												},
+												Ok(None) => {},
+												Err(e) => {
+													tracing::warn!("Failed to poll application status: {e}");
+													break;
+												},
+											}
+											if std::time::Instant::now() >= deadline {
+												break;
+											}
+											std::thread::sleep(poll_interval);
+										}
+										if let Ok(Some(_)) = child.try_wait() {
 											tracing::info!(
 												"Application exited unexpectedly. stdout/stderr saved to: {}",
 												log_path.display()
 											);
 											let _ = app_shutdown_manager
 												.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
-									return Err(AppLaunchError::ExitedEarly);
-										},
-										Ok(None) => {},
-										Err(e) => {
-											tracing::warn!("Failed to poll application status: {e}");
-											break;
-										},
-									}
-									if std::time::Instant::now() >= deadline {
-										break;
-									}
-									std::thread::sleep(poll_interval);
-								}
-								// One final check after the deadline to catch exits that
-								// occurred in the last poll interval before the break.
-								if let Ok(Some(_)) = child.try_wait() {
-									tracing::info!(
-										"Application exited unexpectedly. stdout/stderr saved to: {}",
-										log_path.display()
-									);
-									let _ = app_shutdown_manager
-										.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
-							return Err(AppLaunchError::ExitedEarly);
-							}
+											return Err(AppLaunchError::ExitedEarly);
+										}
 
-							Ok((frame_rx, input_tx, child, log_path))
+										Ok((
+											frame_rx,
+											capture::CaptureInputSender::Compositor(input_tx),
+											LaunchedProcess::Child(child),
+											Some(log_path),
+											ready.hdr,
+										))
+									},
+									CaptureConfig::Wlroots(wlroots_config) => {
+										let (frame_rx, input_tx, ready_rx) = capture::wlroots::start_capture(
+											wlroots_config.clone(),
+											keyboard_config,
+											app_context.resolution.0,
+											app_context.resolution.1,
+											app_context.refresh_rate,
+											compositor_config.gpu.clone(),
+											app_shutdown_manager.clone(),
+										)
+										.map_err(|e| {
+											tracing::error!("Failed to start wlroots capture: {e}");
+											AppLaunchError::CompositorFailed
+										})?;
+
+										let ready = ready_rx
+											.recv_timeout(std::time::Duration::from_secs(5))
+											.map_err(|e| {
+												tracing::warn!("Timed out waiting for wlroots capture: {e}");
+												AppLaunchError::CompositorFailed
+											})?
+											.map_err(|e| {
+												tracing::error!("wlroots capture initialization failed: {e}");
+												AppLaunchError::CompositorFailed
+											})?;
+
+										Ok((frame_rx, input_tx, LaunchedProcess::None, None, ready.hdr))
+									},
+								}
 							})();
 
 							match result {
-								Ok((frame_rx, input_tx, mut child, _log_path)) => {
-									// Send compositor handles back to SessionInner so Start can use them.
-									let _ = handles_tx.send((frame_rx, input_tx));
+								Ok((frame_rx, input_tx, process, _log_path, capture_hdr)) => {
+									// Send capture handles back to SessionInner so Start can use them.
+									let _ = handles_tx.send((frame_rx, input_tx, capture_hdr));
 									// Notify the HTTP handler that launch succeeded.
 									let _ = result_tx.send(Ok(()));
 
-									// Wait for the application to exit.
-									if let Err(e) = child.wait() {
-										tracing::error!("Failed to wait for application: {e}");
+									match process {
+										LaunchedProcess::Child(mut child) => {
+											if let Err(e) = child.wait() {
+												tracing::error!("Failed to wait for application: {e}");
+											}
+											tracing::info!("Application exited.");
+											let _ = app_shutdown_manager
+												.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+										},
+										LaunchedProcess::None => {
+											while !app_shutdown_manager.is_shutdown_triggered() {
+												std::thread::sleep(std::time::Duration::from_millis(100));
+											}
+										},
 									}
-									tracing::info!("Application exited.");
-
-									// Stop the session when the application exits.
-									let _ = app_shutdown_manager
-										.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
 								},
 								Err(err) => {
 									// handles_tx is dropped here — handles_rx will return an error.
@@ -369,10 +427,10 @@ impl SessionInner {
 						_ = stop_session_manager.wait_shutdown_triggered() => None,
 					};
 					match handles_result {
-						Some(Ok(Ok((frame_rx, input_tx)))) => {
+						Some(Ok(Ok((frame_rx, input_tx, capture_hdr)))) => {
 							self.compositor_frame_rx = Some(frame_rx);
 							self.compositor_input_tx = Some(input_tx);
-							self.compositor_hdr = session_context.hdr;
+							self.compositor_hdr = capture_hdr;
 						},
 						Some(Ok(Err(_))) => {
 							// Thread sent an error via result_tx; handles were not produced.
@@ -393,7 +451,7 @@ impl SessionInner {
 					}
 				},
 
-				SessionCommand::Start(video_stream_context, audio_stream_context) => {
+				SessionCommand::Start(mut video_stream_context, audio_stream_context) => {
 					// Retrieve compositor handles that were stored during Launch.
 					let frame_rx = match self.compositor_frame_rx.take() {
 						Some(rx) => rx,
@@ -410,9 +468,15 @@ impl SessionInner {
 						},
 					};
 
-					// HDR mode from RTSP ANNOUNCE (which arrives before PLAY / Start).
-					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
-					self.compositor_hdr = hdr;
+					// HDR mode from RTSP ANNOUNCE is only honored when the capture
+					// backend confirmed HDR support during Launch. wlroots capture is
+					// SDR-only for now.
+					let requested_hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
+					let hdr = self.compositor_hdr && requested_hdr;
+					if requested_hdr && !hdr {
+						tracing::info!("Capture backend is SDR-only; forcing video stream dynamic range to SDR.");
+						video_stream_context.dynamic_range = VideoDynamicRange::Sdr;
+					}
 
 					// HDR metadata watch channel.
 					let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState {

@@ -201,6 +201,10 @@ pub struct ApplicationConfig {
 	/// The command to run.
 	pub command: Vec<String>,
 
+	/// Capture backend to use for this application.
+	#[serde(default, skip_serializing_if = "CaptureConfig::is_default")]
+	pub capture: CaptureConfig,
+
 	/// Commands to run before launching the application.
 	/// Each inner Vec is a separate command; they execute in order.
 	/// Runs synchronously — the application launch waits for all to finish.
@@ -221,6 +225,106 @@ impl ApplicationConfig {
 		let mut hasher = DefaultHasher::new();
 		self.title.hash(&mut hasher);
 		hasher.finish() as i32
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureConfig {
+	/// Launch the app inside Moonshine's embedded compositor.
+	Managed,
+	/// Capture an existing wlroots Wayland output.
+	Wlroots(WlrootsCaptureConfig),
+}
+
+impl Default for CaptureConfig {
+	fn default() -> Self {
+		Self::Managed
+	}
+}
+
+impl CaptureConfig {
+	fn is_default(&self) -> bool {
+		matches!(self, Self::Managed)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WlrootsCaptureConfig {
+	/// Wayland display name or absolute socket path. Defaults to WAYLAND_DISPLAY.
+	pub display: Option<String>,
+	/// wl_output name to capture. Defaults to the first advertised output.
+	pub output: Option<String>,
+	/// Whether the compositor should overlay the cursor into captured frames.
+	pub render_cursor: bool,
+}
+
+impl Default for WlrootsCaptureConfig {
+	fn default() -> Self {
+		Self {
+			display: None,
+			output: None,
+			render_cursor: true,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn application_capture_defaults_to_managed() {
+		let application: ApplicationConfig = toml::from_str(
+			r#"
+title = "Steam"
+command = ["/usr/bin/steam"]
+"#,
+		)
+		.unwrap();
+
+		assert_eq!(application.capture, CaptureConfig::Managed);
+	}
+
+	#[test]
+	fn application_capture_parses_wlroots_config() {
+		let application: ApplicationConfig = toml::from_str(
+			r#"
+title = "Desktop"
+command = []
+
+[capture]
+type = "wlroots"
+display = "wayland-1"
+output = "DP-1"
+render_cursor = false
+"#,
+		)
+		.unwrap();
+
+		assert_eq!(
+			application.capture,
+			CaptureConfig::Wlroots(WlrootsCaptureConfig {
+				display: Some("wayland-1".to_string()),
+				output: Some("DP-1".to_string()),
+				render_cursor: false,
+			})
+		);
+	}
+
+	#[test]
+	fn application_capture_omits_default_when_serialized() {
+		let application = ApplicationConfig {
+			title: "Steam".to_string(),
+			command: vec!["/usr/bin/steam".to_string()],
+			..Default::default()
+		};
+
+		let serialized = toml::to_string(&application).unwrap();
+
+		assert!(!serialized.contains("capture"));
 	}
 }
 

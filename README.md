@@ -111,6 +111,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 - `command`: The command to run. First entry is the executable, the rest are arguments.
 - `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
 - `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
+- `capture` (optional): Capture backend for this application. Defaults to `managed`, which launches the command inside Moonshine's embedded compositor.
 
 Example:
 
@@ -126,6 +127,22 @@ post_command = [
     ["/usr/bin/nvidia-smi", "pstate", "performance"],
 ]
 ```
+
+To capture an existing wlroots desktop session instead of launching an app, use the `wlroots` capture backend:
+
+```toml
+[[application]]
+title = "Desktop"
+command = []
+
+[application.capture]
+type = "wlroots"
+display = "wayland-1"      # optional, defaults to WAYLAND_DISPLAY
+output = "DP-1"            # optional, defaults to the first advertised output
+render_cursor = true
+```
+
+This backend requires the compositor to expose `zwlr_screencopy_manager_v1` v3, `zwp_linux_dmabuf_v1`, `zwlr_virtual_pointer_manager_v1`, and `zwp_virtual_keyboard_manager_v1`. HDR is not advertised for wlroots desktop capture yet.
 
 ### Application scanners
 

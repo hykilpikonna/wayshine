@@ -3,7 +3,8 @@ use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
 use crate::session::{
-	compositor::input::CompositorInputEvent, manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad,
+	capture::CaptureInputSender, compositor::input::CompositorInputEvent, manager::SessionShutdownReason,
+	stream::control::input::gamepad::Gamepad,
 };
 
 use self::{
@@ -109,13 +110,13 @@ impl InputEvent {
 }
 
 pub struct InputHandler {
-	input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	input_tx: CaptureInputSender,
 	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
 	pub fn new(
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		input_tx: CaptureInputSender,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
