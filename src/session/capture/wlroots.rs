@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
@@ -265,6 +266,7 @@ struct WlrootsState {
 
 	screencopy_manager: Option<ZwlrScreencopyManagerV1>,
 	linux_dmabuf: Option<ZwpLinuxDmabufV1>,
+	dmabuf_modifiers: HashMap<u32, Vec<Modifier>>,
 	virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
 	virtual_keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
 	outputs: Vec<OutputInfo>,
@@ -311,6 +313,7 @@ impl WlrootsState {
 			frame_tx,
 			screencopy_manager: None,
 			linux_dmabuf: None,
+			dmabuf_modifiers: HashMap::new(),
 			virtual_pointer_manager: None,
 			virtual_keyboard_manager: None,
 			outputs: Vec::new(),
@@ -652,7 +655,12 @@ impl WlrootsState {
 		}
 
 		let fourcc = Fourcc::try_from(format).map_err(|e| format!("Unsupported screencopy DRM format: {e:?}"))?;
-		let modifiers = [Modifier::Linear, Modifier::Invalid];
+		let modifiers = self
+			.dmabuf_modifiers
+			.get(&format)
+			.filter(|modifiers| !modifiers.is_empty())
+			.cloned()
+			.unwrap_or_else(|| vec![Modifier::Invalid]);
 		let linux_dmabuf = self
 			.linux_dmabuf
 			.as_ref()
@@ -812,14 +820,16 @@ fn create_wl_buffer(
 			modifier_lo,
 		);
 	}
-	Ok(params.create_immed(
+	let wl_buffer = params.create_immed(
 		width as i32,
 		height as i32,
 		format,
 		zwp_linux_buffer_params_v1::Flags::empty(),
 		qh,
 		(),
-	))
+	);
+	params.destroy();
+	Ok(wl_buffer)
 }
 
 fn create_keymap(config: &KeyboardConfig) -> Result<(File, u32, xkb::State), String> {
@@ -890,7 +900,7 @@ impl Dispatch<WlRegistry, ()> for WlrootsState {
 						Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(name, version.min(3), qh, ()));
 				},
 				"zwp_linux_dmabuf_v1" => {
-					state.linux_dmabuf = Some(registry.bind::<ZwpLinuxDmabufV1, _, _>(name, version.min(4), qh, ()));
+					state.linux_dmabuf = Some(registry.bind::<ZwpLinuxDmabufV1, _, _>(name, version.min(3), qh, ()));
 				},
 				"zwlr_virtual_pointer_manager_v1" => {
 					state.virtual_pointer_manager =
@@ -957,6 +967,40 @@ impl Dispatch<WlOutput, OutputData> for WlrootsState {
 	}
 }
 
+impl Dispatch<ZwpLinuxDmabufV1, ()> for WlrootsState {
+	fn event(
+		state: &mut Self,
+		_: &ZwpLinuxDmabufV1,
+		event: wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event,
+		_: &(),
+		_: &Connection,
+		_: &QueueHandle<Self>,
+	) {
+		match event {
+			wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event::Format { format } => {
+				state
+					.dmabuf_modifiers
+					.entry(format)
+					.or_default()
+					.push(Modifier::Invalid);
+			},
+			wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event::Modifier {
+				format,
+				modifier_hi,
+				modifier_lo,
+			} => {
+				let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+				let modifier = Modifier::from(modifier);
+				let modifiers = state.dmabuf_modifiers.entry(format).or_default();
+				if !modifiers.contains(&modifier) {
+					modifiers.push(modifier);
+				}
+			},
+			_ => {},
+		}
+	}
+}
+
 impl Dispatch<ZwlrScreencopyFrameV1, ()> for WlrootsState {
 	fn event(
 		state: &mut Self,
@@ -981,7 +1025,6 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WlrootsState {
 
 delegate_noop!(WlrootsState: ignore WlSeat);
 delegate_noop!(WlrootsState: ignore WlBuffer);
-delegate_noop!(WlrootsState: ignore ZwpLinuxDmabufV1);
 delegate_noop!(WlrootsState: ignore ZwpLinuxBufferParamsV1);
 delegate_noop!(WlrootsState: ignore ZwlrScreencopyManagerV1);
 delegate_noop!(WlrootsState: ignore ZwlrVirtualPointerManagerV1);
