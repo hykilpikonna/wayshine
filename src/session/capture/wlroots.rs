@@ -523,8 +523,8 @@ impl WlrootsState {
 
 		if (width != self.expected_width || height != self.expected_height) && !self.warned_size_mismatch {
 			self.warned_size_mismatch = true;
-			tracing::warn!(
-				"wlroots output size {width}x{height} does not match requested stream size {}x{}; streaming captured output size",
+			tracing::info!(
+				"wlroots output size {width}x{height} does not match requested stream size {}x{}; capture will be aspect-fitted into the stream",
 				self.expected_width,
 				self.expected_height
 			);
@@ -738,17 +738,16 @@ impl WlrootsState {
 				screen_height,
 			} => {
 				if let Some(pointer) = self.virtual_pointer.as_ref() {
-					let x_extent = u32::try_from(screen_width.max(1)).unwrap_or(1);
-					let y_extent = u32::try_from(screen_height.max(1)).unwrap_or(1);
-					let x = u32::try_from(x.max(0)).unwrap_or(0).min(x_extent);
-					let y = u32::try_from(y.max(0)).unwrap_or(0).min(y_extent);
+					let (x, y, x_extent, y_extent) =
+						self.map_stream_point_to_capture(x, y, screen_width, screen_height);
 					pointer.motion_absolute(time, x, y, x_extent, y_extent);
 					pointer.frame();
 				}
 			},
 			CompositorInputEvent::MouseMoveRelative { dx, dy } => {
 				if let Some(pointer) = self.virtual_pointer.as_ref() {
-					pointer.motion(time, dx as f64, dy as f64);
+					let (scale_x, scale_y) = self.stream_to_capture_scale();
+					pointer.motion(time, dx as f64 * scale_x, dy as f64 * scale_y);
 					pointer.frame();
 				}
 			},
@@ -777,6 +776,56 @@ impl WlrootsState {
 				}
 			},
 		}
+	}
+
+	fn map_stream_point_to_capture(
+		&self,
+		x: i16,
+		y: i16,
+		screen_width: i16,
+		screen_height: i16,
+	) -> (u32, u32, u32, u32) {
+		let stream_width = u32::try_from(screen_width.max(1)).unwrap_or(1);
+		let stream_height = u32::try_from(screen_height.max(1)).unwrap_or(1);
+		let capture_width = self.buffer_width.max(1);
+		let capture_height = self.buffer_height.max(1);
+
+		if stream_width == capture_width && stream_height == capture_height {
+			let x = u32::try_from(x.max(0)).unwrap_or(0).min(stream_width);
+			let y = u32::try_from(y.max(0)).unwrap_or(0).min(stream_height);
+			return (x, y, stream_width, stream_height);
+		}
+
+		let (content_x, content_y, content_width, content_height) =
+			aspect_fit(capture_width, capture_height, stream_width, stream_height);
+		let mapped_x = ((x as f64 - content_x) * capture_width as f64 / content_width).clamp(0.0, capture_width as f64);
+		let mapped_y =
+			((y as f64 - content_y) * capture_height as f64 / content_height).clamp(0.0, capture_height as f64);
+
+		(
+			mapped_x.round() as u32,
+			mapped_y.round() as u32,
+			capture_width,
+			capture_height,
+		)
+	}
+
+	fn stream_to_capture_scale(&self) -> (f64, f64) {
+		let stream_width = self.expected_width.max(1);
+		let stream_height = self.expected_height.max(1);
+		let capture_width = self.buffer_width.max(1);
+		let capture_height = self.buffer_height.max(1);
+
+		if stream_width == capture_width && stream_height == capture_height {
+			return (1.0, 1.0);
+		}
+
+		let (_, _, content_width, content_height) =
+			aspect_fit(capture_width, capture_height, stream_width, stream_height);
+		(
+			capture_width as f64 / content_width,
+			capture_height as f64 / content_height,
+		)
 	}
 
 	fn send_key(&mut self, time: u32, keycode: u32, pressed: bool) {
@@ -810,6 +859,20 @@ impl WlrootsState {
 			}
 		}
 	}
+}
+
+fn aspect_fit(source_width: u32, source_height: u32, output_width: u32, output_height: u32) -> (f64, f64, f64, f64) {
+	let source_width = source_width.max(1) as f64;
+	let source_height = source_height.max(1) as f64;
+	let output_width = output_width.max(1) as f64;
+	let output_height = output_height.max(1) as f64;
+	let scale = (output_width / source_width).min(output_height / source_height);
+	let content_width = source_width * scale;
+	let content_height = source_height * scale;
+	let content_x = (output_width - content_width) * 0.5;
+	let content_y = (output_height - content_height) * 0.5;
+
+	(content_x, content_y, content_width, content_height)
 }
 
 fn create_wl_buffer(
@@ -1051,6 +1114,30 @@ delegate_noop!(WlrootsState: ignore ZwpVirtualKeyboardV1);
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn assert_near(actual: f64, expected: f64) {
+		assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
+	}
+
+	#[test]
+	fn aspect_fit_preserves_portrait_capture_in_landscape_stream() {
+		let (x, y, width, height) = aspect_fit(400, 640, 1920, 1080);
+
+		assert_near(x, 622.5);
+		assert_near(y, 0.0);
+		assert_near(width, 675.0);
+		assert_near(height, 1080.0);
+	}
+
+	#[test]
+	fn aspect_fit_uses_full_stream_for_matching_aspect_ratio() {
+		let (x, y, width, height) = aspect_fit(1920, 1080, 1280, 720);
+
+		assert_near(x, 0.0);
+		assert_near(y, 0.0);
+		assert_near(width, 1280.0);
+		assert_near(height, 720.0);
+	}
 
 	#[test]
 	#[ignore = "requires a running wlroots compositor exposing screencopy and virtual input protocols"]

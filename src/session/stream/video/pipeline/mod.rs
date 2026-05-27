@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod blit;
 mod dmabuf;
 mod hdr_sei;
 
@@ -20,6 +21,7 @@ use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
 use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
+use blit::RgbBlitter;
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
@@ -345,6 +347,9 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 
+		// RGB blitter for aspect-fitting wlroots captures into the negotiated stream size.
+		let mut rgb_blitter: Option<RgbBlitter> = None;
+
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
 
@@ -562,8 +567,48 @@ impl VideoPipelineInner {
 					}
 				}
 
+				let needs_blit = frame.width != self.width || frame.height != self.height;
+				let (convert_image, convert_layout) = if needs_blit {
+					let recreate_blitter = match rgb_blitter.as_ref() {
+						Some(blitter) => {
+							blitter.format() != import_vk_format
+								|| blitter.width() != self.width
+								|| blitter.height() != self.height
+						},
+						None => true,
+					};
+					if recreate_blitter {
+						tracing::info!(
+							"Aspect-fitting {}x{} capture into {}x{} stream with Vulkan blit",
+							frame.width,
+							frame.height,
+							self.width,
+							self.height
+						);
+						match RgbBlitter::new(context.clone(), import_vk_format, self.width, self.height) {
+							Ok(blitter) => rgb_blitter = Some(blitter),
+							Err(e) => {
+								tracing::warn!("Failed to create RGB blitter: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
+						}
+					}
+					let blitter = rgb_blitter.as_mut().expect("RGB blitter should be initialized");
+					match blitter.blit_aspect_fit(source_image, src_layout, frame.width, frame.height) {
+						Ok(image) => (image, vk::ImageLayout::GENERAL),
+						Err(e) => {
+							tracing::warn!("RGB blit failed: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					}
+				} else {
+					(source_image, src_layout)
+				};
+
 				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
+				if let Err(e) = converter.convert(convert_image, convert_layout, encoder.input_image()) {
 					tracing::warn!("GPU color conversion failed: {e}");
 					frame.consumed.store(true, Ordering::Release);
 					continue;

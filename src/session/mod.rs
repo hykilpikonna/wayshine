@@ -502,20 +502,33 @@ impl SessionInner {
 					if video_stream_context.width != capture_ready.width
 						|| video_stream_context.height != capture_ready.height
 					{
-						tracing::warn!(
-							"Client video stream size {}x{} does not match capture size {}x{}; encoding capture size",
-							video_stream_context.width,
-							video_stream_context.height,
-							capture_ready.width,
-							capture_ready.height
-						);
-						video_stream_context.width = capture_ready.width;
-						video_stream_context.height = capture_ready.height;
+						match session_context.application.capture {
+							CaptureConfig::Wlroots(_) => {
+								tracing::info!(
+									"Client video stream size {}x{} does not match wlroots capture size {}x{}; preserving client stream size with aspect-correct padding",
+									video_stream_context.width,
+									video_stream_context.height,
+									capture_ready.width,
+									capture_ready.height
+								);
+							},
+							CaptureConfig::Managed => {
+								tracing::warn!(
+									"Client video stream size {}x{} does not match capture size {}x{}; encoding capture size",
+									video_stream_context.width,
+									video_stream_context.height,
+									capture_ready.width,
+									capture_ready.height
+								);
+								video_stream_context.width = capture_ready.width;
+								video_stream_context.height = capture_ready.height;
+							},
+						}
 					}
 					if video_stream_context.fps == 0 {
 						video_stream_context.fps = capture_ready.refresh_rate;
 					}
-					session_context.resolution = (capture_ready.width, capture_ready.height);
+					session_context.resolution = (video_stream_context.width, video_stream_context.height);
 					session_context.refresh_rate = capture_ready.refresh_rate;
 
 					// HDR mode from RTSP ANNOUNCE is only honored when the capture
