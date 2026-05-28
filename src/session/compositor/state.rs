@@ -50,7 +50,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
 use super::cursor::{self, PointerElement, PointerRenderElement};
-use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
+use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, FrameTransform, HdrMetadata};
 use crate::config::KeyboardConfig;
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
@@ -1054,6 +1054,7 @@ impl MoonshineCompositor {
 			created_at: std::time::Instant::now(),
 			buffer_index,
 			consumed: consumed.clone(),
+			transform: FrameTransform::default(),
 			color_space,
 			hdr_metadata,
 		};
@@ -1204,6 +1205,7 @@ impl MoonshineCompositor {
 			created_at: std::time::Instant::now(),
 			buffer_index,
 			consumed: consumed.clone(),
+			transform: FrameTransform::default(),
 			color_space,
 			hdr_metadata,
 		};
@@ -1569,6 +1571,7 @@ fn export_dmabuf(
 		created_at: std::time::Instant::now(),
 		buffer_index,
 		consumed,
+		transform: FrameTransform::default(),
 		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
 		hdr_metadata,
 	})

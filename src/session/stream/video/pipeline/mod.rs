@@ -567,7 +567,8 @@ impl VideoPipelineInner {
 					}
 				}
 
-				let needs_blit = frame.width != self.width || frame.height != self.height;
+				let needs_blit =
+					frame.width != self.width || frame.height != self.height || !frame.transform.is_identity();
 				let (convert_image, convert_layout) = if needs_blit {
 					let recreate_blitter = match rgb_blitter.as_ref() {
 						Some(blitter) => {
@@ -595,7 +596,8 @@ impl VideoPipelineInner {
 						}
 					}
 					let blitter = rgb_blitter.as_mut().expect("RGB blitter should be initialized");
-					match blitter.blit_aspect_fit(source_image, src_layout, frame.width, frame.height) {
+					match blitter.blit_aspect_fit(source_image, src_layout, frame.width, frame.height, frame.transform)
+					{
 						Ok(image) => (image, vk::ImageLayout::GENERAL),
 						Err(e) => {
 							tracing::warn!("RGB blit failed: {e}");

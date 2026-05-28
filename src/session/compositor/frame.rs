@@ -18,6 +18,36 @@ pub enum FrameColorSpace {
 	Bt2020Pq,
 }
 
+/// Axis flips to apply before encoding a captured frame.
+///
+/// wlroots screencopy can report buffers that need Y inversion, and rotated
+/// outputs can produce image orientation that differs from the client's
+/// expected stream orientation. This describes the correction step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameTransform {
+	pub flip_x: bool,
+	pub flip_y: bool,
+}
+
+impl FrameTransform {
+	pub fn is_identity(self) -> bool {
+		!self.flip_x && !self.flip_y
+	}
+
+	pub fn with_y_inverted(mut self) -> Self {
+		self.flip_y = !self.flip_y;
+		self
+	}
+
+	pub fn with_y_inverted_if(self, y_inverted: bool) -> Self {
+		if y_inverted {
+			self.with_y_inverted()
+		} else {
+			self
+		}
+	}
+}
+
 /// Static HDR metadata (HDR10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HdrMetadata {
@@ -99,6 +129,8 @@ pub struct ExportedFrame {
 	/// completes, signalling the compositor that this GBM buffer may be
 	/// reused for rendering.
 	pub consumed: Arc<AtomicBool>,
+	/// Orientation correction to apply before encoding.
+	pub transform: FrameTransform,
 	/// Color space of the rendered frame.
 	pub color_space: FrameColorSpace,
 	/// Optional HDR metadata from the composited content.

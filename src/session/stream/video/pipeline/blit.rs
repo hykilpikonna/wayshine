@@ -4,6 +4,8 @@
 use ash::vk;
 use pixelforge::VideoContext;
 
+use crate::session::compositor::frame::FrameTransform;
+
 pub struct RgbBlitter {
 	context: VideoContext,
 	format: vk::Format,
@@ -131,6 +133,7 @@ impl RgbBlitter {
 		src_layout: vk::ImageLayout,
 		src_width: u32,
 		src_height: u32,
+		transform: FrameTransform,
 	) -> Result<vk::Image, String> {
 		let device = self.context.device();
 		let src_width = src_width.max(1);
@@ -247,14 +250,7 @@ impl RgbBlitter {
 					base_array_layer: 0,
 					layer_count: 1,
 				},
-				src_offsets: [
-					vk::Offset3D { x: 0, y: 0, z: 0 },
-					vk::Offset3D {
-						x: src_width as i32,
-						y: src_height as i32,
-						z: 1,
-					},
-				],
+				src_offsets: source_offsets(src_width, src_height, transform),
 				dst_subresource: vk::ImageSubresourceLayers {
 					aspect_mask: vk::ImageAspectFlags::COLOR,
 					mip_level: 0,
@@ -373,6 +369,22 @@ fn aspect_fit_rect(source_width: u32, source_height: u32, output_width: u32, out
 	BlitRect { x, y, width, height }
 }
 
+fn source_offsets(src_width: u32, src_height: u32, transform: FrameTransform) -> [vk::Offset3D; 2] {
+	let left = if transform.flip_x { src_width as i32 } else { 0 };
+	let right = if transform.flip_x { 0 } else { src_width as i32 };
+	let top = if transform.flip_y { src_height as i32 } else { 0 };
+	let bottom = if transform.flip_y { 0 } else { src_height as i32 };
+
+	[
+		vk::Offset3D { x: left, y: top, z: 0 },
+		vk::Offset3D {
+			x: right,
+			y: bottom,
+			z: 1,
+		},
+	]
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -401,5 +413,20 @@ mod tests {
 				height: 720,
 			}
 		);
+	}
+
+	#[test]
+	fn source_offsets_apply_180_degree_flip() {
+		let offsets = source_offsets(
+			1920,
+			1080,
+			FrameTransform {
+				flip_x: true,
+				flip_y: true,
+			},
+		);
+
+		assert_eq!((offsets[0].x, offsets[0].y), (1920, 1080));
+		assert_eq!((offsets[1].x, offsets[1].y), (0, 0));
 	}
 }

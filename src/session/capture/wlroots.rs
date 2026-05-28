@@ -32,7 +32,7 @@ use xkbcommon::xkb;
 use crate::config::{KeyboardConfig, WlrootsCaptureConfig};
 use crate::session::capture::CaptureInputSender;
 use crate::session::compositor::find_render_node;
-use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace};
+use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, FrameTransform};
 use crate::session::compositor::input::CompositorInputEvent;
 use crate::session::manager::SessionShutdownReason;
 
@@ -142,7 +142,8 @@ fn run_capture(
 	state.start_capture(&qh, true)?;
 
 	while state.startup_result.is_none() && !stop.is_shutdown_triggered() {
-		dispatch_once(&connection, &mut event_queue, &mut state, WAYLAND_POLL_TIMEOUT_MS)?;
+		let poll_timeout_ms = state.next_poll_timeout_ms(WAYLAND_POLL_TIMEOUT_MS);
+		dispatch_once(&connection, &mut event_queue, &mut state, poll_timeout_ms)?;
 		state.process_pending_input(&connection, &input_rx);
 	}
 
@@ -171,7 +172,8 @@ fn run_capture(
 
 	while !stop.is_shutdown_triggered() {
 		state.process_pending_input(&connection, &input_rx);
-		dispatch_once(&connection, &mut event_queue, &mut state, WAYLAND_POLL_TIMEOUT_MS)?;
+		let poll_timeout_ms = state.next_poll_timeout_ms(WAYLAND_POLL_TIMEOUT_MS);
+		dispatch_once(&connection, &mut event_queue, &mut state, poll_timeout_ms)?;
 		state.start_capture(&qh, false)?;
 	}
 
@@ -255,6 +257,7 @@ struct OutputInfo {
 	description: Option<String>,
 	width: u32,
 	height: u32,
+	transform: i32,
 }
 
 struct CaptureSlot {
@@ -289,6 +292,7 @@ struct WlrootsState {
 	seat: Option<WlSeat>,
 
 	selected_output: Option<WlOutput>,
+	selected_output_transform: i32,
 	virtual_pointer: Option<ZwlrVirtualPointerV1>,
 	virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
 	keymap_file: Option<File>,
@@ -308,6 +312,7 @@ struct WlrootsState {
 	startup_complete: bool,
 	warned_y_inverted: bool,
 	warned_size_mismatch: bool,
+	warned_unsupported_transform: bool,
 }
 
 impl WlrootsState {
@@ -336,6 +341,7 @@ impl WlrootsState {
 			outputs: Vec::new(),
 			seat: None,
 			selected_output: None,
+			selected_output_transform: 0,
 			virtual_pointer: None,
 			virtual_keyboard: None,
 			keymap_file: None,
@@ -353,6 +359,7 @@ impl WlrootsState {
 			startup_complete: false,
 			warned_y_inverted: false,
 			warned_size_mismatch: false,
+			warned_unsupported_transform: false,
 		}
 	}
 
@@ -387,8 +394,12 @@ impl WlrootsState {
 			.or(output.description.as_deref())
 			.map(ToOwned::to_owned)
 			.unwrap_or_else(|| format!("#{}", output.global_name));
-		tracing::info!("wlroots capture selected output: {output_name}");
+		tracing::info!(
+			"wlroots capture selected output: {output_name} (transform: {})",
+			output_transform_name(output.transform)
+		);
 		self.selected_output = Some(output.output.clone());
+		self.selected_output_transform = output.transform;
 
 		self.init_virtual_input(qh)?;
 		connection
@@ -503,6 +514,26 @@ impl WlrootsState {
 		Ok(())
 	}
 
+	fn next_poll_timeout_ms(&self, max_timeout_ms: i32) -> i32 {
+		if self.capture_in_progress {
+			return max_timeout_ms;
+		}
+		let Some(last_capture_at) = self.last_capture_at else {
+			return 0;
+		};
+		let elapsed = last_capture_at.elapsed();
+		if elapsed >= self.frame_interval {
+			return 0;
+		}
+
+		let remaining_us = (self.frame_interval - elapsed).as_micros();
+		if remaining_us < 500 {
+			return 0;
+		}
+		let remaining_ms = ((remaining_us + 999) / 1000) as i32;
+		remaining_ms.clamp(0, max_timeout_ms)
+	}
+
 	fn handle_linux_dmabuf_offer(&mut self, format: u32, width: u32, height: u32) {
 		if let Some(pending) = self.pending_frame.as_mut() {
 			pending.offered_format = Some(format);
@@ -568,7 +599,14 @@ impl WlrootsState {
 		};
 		if pending.y_inverted && !self.warned_y_inverted {
 			self.warned_y_inverted = true;
-			tracing::warn!("wlroots screencopy reported y-inverted frames; v1 streams them without correction");
+			tracing::info!("wlroots screencopy reported y-inverted frames; applying Y flip before encoding");
+		}
+		if output_transform_swaps_axes(self.selected_output_transform) && !self.warned_unsupported_transform {
+			self.warned_unsupported_transform = true;
+			tracing::warn!(
+				"wlroots output transform {} swaps axes; current Vulkan blit correction only supports flips/180-degree rotation",
+				output_transform_name(self.selected_output_transform)
+			);
 		}
 
 		let slot = &self.buffer_pool[slot_index];
@@ -595,6 +633,7 @@ impl WlrootsState {
 			created_at: Instant::now(),
 			buffer_index: slot_index,
 			consumed: slot.consumed.clone(),
+			transform: output_frame_transform(self.selected_output_transform).with_y_inverted_if(pending.y_inverted),
 			color_space: FrameColorSpace::Srgb,
 			hdr_metadata: None,
 		};
@@ -875,6 +914,42 @@ fn aspect_fit(source_width: u32, source_height: u32, output_width: u32, output_h
 	(content_x, content_y, content_width, content_height)
 }
 
+fn output_frame_transform(transform: i32) -> FrameTransform {
+	match transform {
+		2 => FrameTransform {
+			flip_x: true,
+			flip_y: true,
+		},
+		4 => FrameTransform {
+			flip_x: true,
+			flip_y: false,
+		},
+		6 => FrameTransform {
+			flip_x: false,
+			flip_y: true,
+		},
+		_ => FrameTransform::default(),
+	}
+}
+
+fn output_transform_swaps_axes(transform: i32) -> bool {
+	matches!(transform, 1 | 3 | 5 | 7)
+}
+
+fn output_transform_name(transform: i32) -> &'static str {
+	match transform {
+		0 => "normal",
+		1 => "90",
+		2 => "180",
+		3 => "270",
+		4 => "flipped",
+		5 => "flipped-90",
+		6 => "flipped-180",
+		7 => "flipped-270",
+		_ => "unknown",
+	}
+}
+
 fn create_wl_buffer(
 	linux_dmabuf: &ZwpLinuxDmabufV1,
 	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
@@ -1002,6 +1077,7 @@ impl Dispatch<WlRegistry, ()> for WlrootsState {
 						description: None,
 						width: 0,
 						height: 0,
+						transform: 0,
 					});
 				},
 				_ => {},
@@ -1031,6 +1107,12 @@ impl Dispatch<WlOutput, OutputData> for WlrootsState {
 			return;
 		};
 		match event {
+			wl_output::Event::Geometry { transform, .. } => {
+				output.transform = match transform {
+					WEnum::Value(transform) => transform as i32,
+					WEnum::Unknown(raw) => i32::try_from(raw).unwrap_or(-1),
+				};
+			},
 			wl_output::Event::Mode { width, height, .. } => {
 				output.width = width.max(0) as u32;
 				output.height = height.max(0) as u32;
